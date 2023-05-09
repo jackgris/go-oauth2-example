@@ -1,12 +1,14 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
+	"bytes"
+	"context"
 	"log"
 	"net/http"
 
+	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/valyala/fasthttp/fasthttpadaptor"
 
 	"github.com/go-oauth2/oauth2/v4/errors"
 	"github.com/go-oauth2/oauth2/v4/manage"
@@ -27,6 +29,7 @@ func main() {
 
 	manager.MapClientStorage(clientStore)
 
+	// create the default authorization server
 	srv := server.NewDefaultServer(manager)
 	srv.SetAllowGetAccessRequest(true)
 	srv.SetClientInfoHandler(server.ClientFormHandler)
@@ -41,11 +44,32 @@ func main() {
 		log.Println("Response Error:", re.Error.Error())
 	})
 
-	http.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
-		_ = srv.HandleTokenRequest(w, r)
-	})
+	app := fiber.New()
+	app.Get("/token", Token(srv))
+	app.Get("/credentials", Credentials(clientStore))
+	app.Get("/protected", ValidateToken(Protected, srv))
+	app.Get("/", Home)
+	log.Fatal(app.Listen(":3000"))
+}
 
-	http.HandleFunc("/credentials", func(w http.ResponseWriter, r *http.Request) {
+func Token(srv *server.Server) fiber.Handler {
+	// first, create a Handlerfunc because go-oauth2/oauth2 library was
+	// created to be used with the standard net/http library
+	var h http.HandlerFunc = func(w http.ResponseWriter, r *http.Request) {
+		_ = srv.HandleTokenRequest(w, r)
+	}
+
+	// wraps net/http HandlerFunc to fiber handler
+	return func(c *fiber.Ctx) error {
+		c.Request()
+		handler := fasthttpadaptor.NewFastHTTPHandler(h)
+		handler(c.Context())
+		return nil
+	}
+}
+
+func Credentials(clientStore *store.ClientStore) fiber.Handler {
+	handler := func(c *fiber.Ctx) error {
 		clientId := uuid.New().String()[:8]
 		clientSecret := uuid.New().String()[:8]
 		err := clientStore.Set(clientId, &models.Client{
@@ -54,33 +78,46 @@ func main() {
 			Domain: "http://localhost:9094",
 		})
 		if err != nil {
-			fmt.Println(err.Error())
+			return err
 		}
+		r := map[string]string{"CLIENT_ID": clientId, "CLIENT_SECRET": clientSecret}
+		c.Status(http.StatusOK)
+		return c.JSON(r)
+	}
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"CLIENT_ID": clientId, "CLIENT_SECRET": clientSecret})
-	})
-
-	http.HandleFunc("/protected", validateToken(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("Hello, I'm protected"))
-	}, srv))
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("Hi! I'm not protected"))
-	})
-
-	fmt.Println("Serving start, running on http://localhost:9096")
-	log.Fatal(http.ListenAndServe(":9096", nil))
+	return handler
 }
 
-func validateToken(f http.HandlerFunc, srv *server.Server) http.HandlerFunc {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, err := srv.ValidationBearerToken(r)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+func Home(c *fiber.Ctx) error {
+	return c.SendString("Hello, I'm not protected 👋!")
+}
 
-		f.ServeHTTP(w, r)
-	})
+func Protected(c *fiber.Ctx) error {
+	return c.SendString("I'm protected 👋!")
+}
+
+func NotAllowed(c *fiber.Ctx) error {
+	return c.SendString("You Shall Not Pass!")
+}
+
+func ValidateToken(hand fiber.Handler, srv *server.Server) fiber.Handler {
+
+	handler := func(c *fiber.Ctx) error {
+
+		ctx := context.TODO()
+		method := c.Method()
+		url := c.OriginalURL()
+		body := c.Body()
+		r, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
+		if err != nil {
+			return NotAllowed(c)
+		}
+		_, err = srv.ValidationBearerToken(r)
+		if err != nil {
+			return NotAllowed(c)
+		}
+		return hand(c)
+	}
+
+	return handler
 }
